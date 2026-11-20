@@ -109,3 +109,29 @@ little-endian 16-bit integer in the two bytes following the tag byte.
 These are like the copies with 2-byte offsets (see previous subsection),
 except that the offset is stored as a 32-bit integer instead of a
 16-bit integer (and thus will occupy four bytes).
+
+
+3. Prefix-dictionary mode
+
+The regular compressor builds an independent hash table for every
+kBlockSize (32768-byte) block, so small files that share vocabulary cannot
+reference one another. The optional prefix-dictionary entry points
+(CompressWithDictionary / UncompressWithDictionary and their Raw variants)
+seed the first block's hash table with a caller-provided dictionary.
+
+The on-the-wire format is unchanged: the stream still starts with the
+varint-encoded uncompressed length and consists of the same literal/copy
+tags. The dictionary itself is never emitted. What changes is the meaning of
+the copy offsets in the first block: an offset may reach into the dictionary,
+which the decompressor places logically immediately before the first output
+byte. The dictionary is limited to kBlockSize bytes, and dictionary plus the
+first block must fit in the 65535-byte window addressable by a copy offset;
+older dictionary bytes are dropped when they do not fit. Only the first
+block may reference the dictionary; subsequent blocks use a freshly cleared
+table exactly as in the regular compressor.
+
+Because the framing is identical, dictionary-free streams remain decodable
+through the existing Uncompress entry points. A dictionary stream requires
+the matching dictionary at decompression time; without it, back-references
+that precede the first output byte are rejected as invalid rather than read
+out of bounds.

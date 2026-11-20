@@ -180,6 +180,30 @@ char* CompressFragment(const char* input,
                        uint16_t* table,
                        const int table_size);
 
+// Like CompressFragment(), but the table is pre-populated with entries from a
+// prefix dictionary. The dictionary is not part of the emitted output; it only
+// provides match candidates for "input".
+//
+// REQUIRES: "input_length <= kBlockSize"
+// REQUIRES: "dictionary_length <= kBlockSize"
+// REQUIRES: "input_length + dictionary_length <= kBlockSize"
+// REQUIRES: "op" points to an array of memory that is at least
+// "MaxCompressedLength(input_length)" in size.
+// REQUIRES: All elements in "table[0..table_size-1]" are initialized to zero.
+// REQUIRES: "table_size" is a power of two
+//
+// The emitted byte stream is a regular snappy tag stream (no uncompressed
+// length prefix) whose copy offsets may refer back into the dictionary. A
+// decompressor therefore needs the same dictionary placed immediately before
+// the output buffer.
+char* CompressFragmentWithDictionary(const char* input,
+                                     size_t input_length,
+                                     const char* dictionary,
+                                     size_t dictionary_length,
+                                     char* op,
+                                     uint16_t* table,
+                                     const int table_size);
+
 // Find the largest n such that
 //
 //   s1[0,n-1] == s2[0,n-1]

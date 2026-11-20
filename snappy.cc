@@ -979,6 +979,131 @@ emit_remainder:
   return op;
 }
 
+char* CompressFragmentWithDictionary(const char* input, size_t input_size,
+                                     const char* dictionary,
+                                     size_t dictionary_size, char* op,
+                                     uint16_t* table,
+                                     const int table_size) {
+  // Matches may point into "dictionary". The two buffers are not required to
+  // be adjacent in memory, so we keep them logically adjacent by treating the
+  // dictionary as occupying virtual offsets [0, dictionary_size) and the
+  // input as offsets [dictionary_size, dictionary_size + input_size).
+  assert(input_size <= kBlockSize);
+  assert(dictionary_size <= kBlockSize);
+  assert(input_size + dictionary_size <= kBlockSize);
+  assert((table_size & (table_size - 1)) == 0);  // table must be power of two
+
+  const uint32_t mask = 2 * (table_size - 1);
+
+  // Seed the table with 4-byte hashes taken from the dictionary. Positions are
+  // stored relative to the virtual base, so a hit yields a copy offset that
+  // reaches into the dictionary when decompressed with the dictionary placed
+  // immediately before the output buffer.
+  for (size_t i = 0; i + 4 <= dictionary_size; ++i) {
+    uint32_t dword = LittleEndian::Load32(dictionary + i);
+    *TableEntry(table, dword, mask) = static_cast<uint16_t>(i);
+  }
+
+  const char* ip = input;
+  const char* ip_end = input + input_size;
+  const char* base_ip = input;
+  const char* next_emit = ip;
+  const size_t kInputMarginBytes = 15;
+
+  if (input_size >= kInputMarginBytes) {
+    const char* ip_limit = input + input_size - kInputMarginBytes;
+
+    uint32_t skip = 32;
+    while (ip <= ip_limit) {
+      uint32_t data = LittleEndian::Load32(ip);
+      uint16_t* table_entry = TableEntry(table, data, mask);
+      uint32_t candidate_offset = *table_entry;
+      *table_entry = static_cast<uint16_t>(dictionary_size + (ip - base_ip));
+
+      const char* candidate;
+      bool match_in_dictionary;
+      if (candidate_offset < dictionary_size) {
+        candidate = dictionary + candidate_offset;
+        match_in_dictionary = true;
+      } else {
+        candidate = base_ip + (candidate_offset - dictionary_size);
+        match_in_dictionary = false;
+      }
+
+      // candidate_offset is zero only for an untouched (zeroed) slot, in which
+      // case candidate points at ip itself and the four bytes naturally match;
+      // an offset of zero is not encodable, so skip this position.
+      if (candidate_offset != 0 &&
+          LittleEndian::Load32(candidate) == data) {
+        // Extend the match forwards. The virtual source is the dictionary
+        // immediately followed by the input. When a dictionary-rooted match
+        // reaches the dictionary boundary the source continues at the start
+        // of the input; drive both cursors explicitly so no physical
+        // adjacency between the two buffers is required.
+        size_t matched = 0;
+        const char* src = candidate;
+        const char* dst = ip;
+        const char* dict_end = dictionary + dictionary_size;
+        while (dst < ip_end) {
+          if (match_in_dictionary && src == dict_end) {
+            src = base_ip;
+            match_in_dictionary = false;
+          }
+          if (*dst != *src) break;
+          ++dst;
+          ++src;
+          ++matched;
+        }
+
+        if (matched >= 4) {
+          const char* base = ip;
+          size_t offset = dictionary_size + (base - base_ip) - candidate_offset;
+          assert(offset > 0);
+          assert(offset < 65536);
+
+          if (base > next_emit) {
+            op = EmitLiteral</*allow_fast_path=*/false>(op, next_emit,
+                                                         base - next_emit);
+          }
+          if (matched < 12) {
+            op = EmitCopy</*len_less_than_12=*/true>(op, offset, matched);
+          } else {
+            op = EmitCopy</*len_less_than_12=*/false>(op, offset, matched);
+          }
+
+          ip += matched;
+          next_emit = ip;
+          skip = 32;
+          if (ip > ip_limit) goto emit_remainder;
+
+          // Insert hashes for the bytes covered by the match, mirroring the
+          // behaviour of CompressFragment() so later blocks can match on them.
+          size_t insert_count = std::min<size_t>(matched - 1, ip - base_ip);
+          for (size_t j = 1; j <= insert_count; ++j) {
+            const char* insert_ip = ip - j;
+            uint32_t dword = LittleEndian::Load32(insert_ip);
+            *TableEntry(table, dword, mask) = static_cast<uint16_t>(
+                dictionary_size + (insert_ip - base_ip));
+          }
+          continue;
+        }
+      }
+
+      uint32_t bytes_between_hash_lookups = skip >> 5;
+      skip += bytes_between_hash_lookups;
+      ip += bytes_between_hash_lookups + 1;
+    }
+  }
+
+emit_remainder:
+  if (next_emit < ip_end) {
+    op = EmitLiteral</*allow_fast_path=*/false>(op, next_emit,
+                                                 ip_end - next_emit);
+  }
+
+  return op;
+}
+
 char* CompressFragmentDoubleHash(const char* input, size_t input_size, char* op,
                                  uint16_t* table, const int table_size,
                                  uint16_t* table2, const int table_size2) {
@@ -1889,7 +2014,9 @@ size_t Compress(Source* reader, Sink* writer) {
 
 static size_t InternalCompress(Source* reader, Sink* writer,
                                CompressionOptions options,
-                               internal::WorkingMemory* wmem) {
+                               internal::WorkingMemory* wmem,
+                               const char* dictionary = nullptr,
+                               size_t dictionary_size = 0) {
   assert(options.level == 1 || options.level == 2);
   size_t written = 0;
   size_t N = reader->Available();
@@ -1902,6 +2029,7 @@ static size_t InternalCompress(Source* reader, Sink* writer,
   writer->Append(ulength, p - ulength);
   written += (p - ulength);
 
+  bool first_block = true;
   while (N > 0) {
     // Get next block to compress (without copying if possible)
     size_t fragment_size;
@@ -1947,14 +2075,26 @@ static size_t InternalCompress(Source* reader, Sink* writer,
     // have room for us directly.
     char* dest = writer->GetAppendBuffer(max_output, wmem->GetScratchOutput());
     char* end = nullptr;
-      if (options.level == 1) {
-        end = internal::CompressFragment(fragment, fragment_size, dest, table,
-                                         table_size);
-      } else if (options.level == 2) {
-        end = internal::CompressFragmentDoubleHash(
-            fragment, fragment_size, dest, table, table_size >> 1,
-            table + (table_size >> 1), table_size >> 1);
-      }
+    if (first_block && dictionary != nullptr && dictionary_size > 0) {
+      assert(options.level == 1);
+      assert(fragment_size + dictionary_size <= kBlockSize);
+      end = internal::CompressFragmentWithDictionary(
+          fragment, fragment_size, dictionary, dictionary_size, dest, table,
+          table_size);
+    } else if (options.level == 1) {
+      end = internal::CompressFragment(fragment, fragment_size, dest, table,
+                                       table_size);
+    } else if (options.level == 2) {
+      end = internal::CompressFragmentDoubleHash(
+          fragment, fragment_size, dest, table, table_size >> 1,
+          table + (table_size >> 1), table_size >> 1);
+    }
+
+    // The dictionary is only eligible for the first block: the 16-bit copy
+    // offset can reach at most 65535 bytes back, and later blocks are already
+    // separated from the dictionary by a full kBlockSize of input. Subsequent
+    // blocks fall back to an independent, freshly cleared table.
+    first_block = false;
 
     writer->Append(dest, end - dest);
     written += (end - dest);
@@ -1975,6 +2115,54 @@ size_t Compress(Source* reader, Sink* writer, CompressionOptions options,
   assert(ctx != nullptr);
   assert(ctx->working_memory_ != nullptr);
   return InternalCompress(reader, writer, options, ctx->working_memory_);
+}
+
+size_t CompressWithDictionary(const char* dictionary, size_t dictionary_size,
+                              const char* input, size_t input_length,
+                              std::string* compressed) {
+  const size_t first_block = std::min(input_length, kBlockSize);
+  if (dictionary_size > kBlockSize) {
+    // Keep only the most recent kBlockSize bytes: older bytes could never be
+    // reached by a 16-bit copy offset anyway.
+    dictionary += dictionary_size - kBlockSize;
+    dictionary_size = kBlockSize;
+  }
+  if (dictionary_size + first_block > kBlockSize) {
+    // The first block plus the dictionary must fit into a single 64KiByte
+    // offset window (a copy offset cannot exceed 65535). Drop the oldest
+    // dictionary bytes rather than emitting unrepresentable back-references.
+    size_t excess = dictionary_size + first_block - kBlockSize;
+    dictionary += excess;
+    dictionary_size -= excess;
+  }
+  compressed->resize(MaxCompressedLength(input_length));
+  ByteArraySource reader(input, input_length);
+  UncheckedByteArraySink writer(string_as_array(compressed));
+  internal::WorkingMemory wmem(std::min(input_length, kBlockSize));
+  size_t written = InternalCompress(&reader, &writer, CompressionOptions{},
+                                    &wmem, dictionary, dictionary_size);
+  compressed->resize(written);
+  return written;
+}
+
+void RawCompressWithDictionary(const char* dictionary, size_t dictionary_size,
+                               const char* input, size_t input_length,
+                               char* compressed, size_t* compressed_length) {
+  const size_t first_block = std::min(input_length, kBlockSize);
+  if (dictionary_size > kBlockSize) {
+    dictionary += dictionary_size - kBlockSize;
+    dictionary_size = kBlockSize;
+  }
+  if (dictionary_size + first_block > kBlockSize) {
+    size_t excess = dictionary_size + first_block - kBlockSize;
+    dictionary += excess;
+    dictionary_size -= excess;
+  }
+  ByteArraySource reader(input, input_length);
+  UncheckedByteArraySink writer(compressed);
+  internal::WorkingMemory wmem(std::min(input_length, kBlockSize));
+  *compressed_length = InternalCompress(&reader, &writer, CompressionOptions{},
+                                        &wmem, dictionary, dictionary_size);
 }
 
 CompressionContext::CompressionContext()
@@ -2302,16 +2490,35 @@ class SnappyArrayWriter {
   // If op < op_limit_min_slop_ then it's safe to unconditionally write
   // kSlopBytes starting at op.
   char* op_limit_min_slop_;
+  // Number of dictionary bytes physically laid out before the output region.
+  // Zero in the regular (non-dictionary) case.
+  size_t dictionary_size_;
 
  public:
   inline explicit SnappyArrayWriter(char* dst)
       : base_(dst),
         op_(dst),
         op_limit_(dst),
-        op_limit_min_slop_(dst) {}  // Safe default see invariant.
+        op_limit_min_slop_(dst),  // Safe default see invariant.
+        dictionary_size_(0) {}
+
+  // Dictionary mode: "dst_base" points at the start of a dictionary that is
+  // physically laid out immediately before the output region "dst". Copy
+  // offsets may then reach up to "dictionary_size" bytes before the first
+  // output byte. Only the dictionary bytes themselves may be referenced that
+  // way; offsets reaching before "dst_base" are rejected as corrupt.
+  inline SnappyArrayWriter(char* dst_base, char* dst, size_t dictionary_size)
+      : base_(dst_base),
+        op_(dst),
+        op_limit_(dst),
+        op_limit_min_slop_(dst),
+        dictionary_size_(dictionary_size) {}
 
   inline void SetExpectedLength(size_t len) {
-    op_limit_ = op_ + len;
+    // "len" is the number of payload bytes described by the stream. In
+    // dictionary mode the output starts "dictionary_size_" bytes after
+    // base_, so the absolute end of the buffer accounts for the prefix.
+    op_limit_ = base_ + dictionary_size_ + len;
     // Prevent pointer from being past the buffer.
     op_limit_min_slop_ = op_limit_ - std::min<size_t>(kSlopBytes - 1, len);
   }
@@ -2355,11 +2562,20 @@ class SnappyArrayWriter {
     assert(op >= base_);
     char* const op_end = op + len;
 
-    // Check if we try to append from before the start of the buffer.
+    // Check if we try to append from before the start of the (possibly
+    // dictionary-prefixed) buffer.
     if (SNAPPY_PREDICT_FALSE(static_cast<size_t>(op - base_) < offset))
       return false;
 
-    if (SNAPPY_PREDICT_FALSE((kSlopBytes < 64 && len > kSlopBytes) ||
+    // In dictionary mode the source of a copy may start before the output
+    // region. The fixed-size memmove fast path may only read within the
+    // output, so fall back to the byte-at-a-time copy whenever the source
+    // lies in the dictionary.
+    const bool source_in_dictionary =
+        dictionary_size_ > 0 &&
+        static_cast<size_t>(op - (base_ + dictionary_size_)) < offset;
+    if (SNAPPY_PREDICT_FALSE(source_in_dictionary ||
+                            (kSlopBytes < 64 && len > kSlopBytes) ||
                             op >= op_limit_min_slop_ || offset < len)) {
       if (op_end > op_limit_ || offset == 0) return false;
       *op_p = IncrementalCopy(op - offset, op, op_end, op_limit_);
@@ -2385,6 +2601,61 @@ bool RawUncompress(const char* compressed, size_t compressed_length,
 bool RawUncompress(Source* compressed, char* uncompressed) {
   SnappyArrayWriter output(uncompressed);
   return InternalUncompress(compressed, &output);
+}
+
+bool RawUncompressWithDictionary(const char* compressed,
+                                 size_t compressed_length,
+                                 const char* dictionary,
+                                 size_t dictionary_size,
+                                 char* uncompressed) {
+  if (dictionary_size > kBlockSize) return false;
+  // The dictionary must be physically adjacent to the output so that copy
+  // offsets can address it. Allocate one buffer, copy the dictionary into its
+  // prefix, and decompress directly after it.
+  size_t ulength;
+  if (!GetUncompressedLength(compressed, compressed_length, &ulength)) {
+    return false;
+  }
+  std::unique_ptr<char[]> buffer(new char[dictionary_size + ulength]);
+  if (dictionary_size > 0) {
+    std::memcpy(buffer.get(), dictionary, dictionary_size);
+  }
+  char* output = buffer.get() + dictionary_size;
+  ByteArraySource reader(compressed, compressed_length);
+  SnappyArrayWriter writer(buffer.get(), output, dictionary_size);
+  if (!InternalUncompress(&reader, &writer)) {
+    return false;
+  }
+  std::memcpy(uncompressed, output, ulength);
+  return true;
+}
+
+bool UncompressWithDictionary(const char* compressed,
+                              size_t compressed_length,
+                              const char* dictionary, size_t dictionary_size,
+                              std::string* uncompressed) {
+  size_t ulength;
+  if (!GetUncompressedLength(compressed, compressed_length, &ulength)) {
+    return false;
+  }
+  if (dictionary_size > kBlockSize ||
+      ulength > uncompressed->max_size()) {
+    return false;
+  }
+  STLStringResizeUninitialized(uncompressed, dictionary_size + ulength);
+  char* base = string_as_array(uncompressed);
+  if (dictionary_size > 0) {
+    std::memcpy(base, dictionary, dictionary_size);
+  }
+  ByteArraySource reader(compressed, compressed_length);
+  SnappyArrayWriter writer(base, base + dictionary_size, dictionary_size);
+  bool ok = InternalUncompress(&reader, &writer);
+  if (ok) {
+    // Drop the dictionary prefix before handing the result back.
+    std::memmove(base, base + dictionary_size, ulength);
+    uncompressed->resize(ulength);
+  }
+  return ok;
 }
 
 bool Uncompress(const char* compressed, size_t compressed_length,

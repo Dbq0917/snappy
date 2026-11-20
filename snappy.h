@@ -190,6 +190,50 @@ class WorkingMemory;
   // returns false if the message is corrupted and could not be decompressed
   bool Uncompress(Source* compressed, Sink* uncompressed);
 
+  // Prefix-dictionary compression.
+  //
+  // "dictionary[0..dictionary_size-1]" is not emitted into the output, but the
+  // first block of "input" may emit copy tags that refer back into it. The
+  // resulting stream is otherwise an ordinary snappy stream (same framing and
+  // uncompressed-length header), so a decompressor must be given the identical
+  // dictionary via UncompressWithDictionary()/RawUncompressWithDictionary().
+  // Streams produced without a dictionary keep decompressing through the
+  // regular Uncompress() entry points, so both formats coexist.
+  //
+  // The dictionary is capped at kBlockSize bytes (only the last kBlockSize
+  // bytes are kept when longer). When the dictionary plus the first input
+  // block would exceed a single 65535-byte offset window, the oldest
+  // dictionary bytes are dropped until it fits. Returns zero only when the
+  // input itself is too large for the snappy framing (>= 2^32 bytes).
+  size_t CompressWithDictionary(const char* dictionary, size_t dictionary_size,
+                                const char* input, size_t input_length,
+                                std::string* compressed);
+
+  // Raw variant of the above: "compressed" must point to at least
+  // MaxCompressedLength(input_length) bytes.
+  void RawCompressWithDictionary(const char* dictionary,
+                                 size_t dictionary_size, const char* input,
+                                 size_t input_length, char* compressed,
+                                 size_t* compressed_length);
+
+  // Decompresses a stream produced by CompressWithDictionary(), using
+  // "dictionary" to resolve copy offsets that precede the first output byte.
+  // The given dictionary must be the one used for compression (or a longer
+  // buffer whose tail matches it, since only the last kBlockSize bytes can be
+  // referenced). Returns false if the dictionary is larger than kBlockSize or
+  // the stream is corrupted. Passing a null/zero-length dictionary is
+  // equivalent to the regular Uncompress() routines.
+  bool UncompressWithDictionary(const char* compressed,
+                                size_t compressed_length,
+                                const char* dictionary,
+                                size_t dictionary_size,
+                                std::string* uncompressed);
+  bool RawUncompressWithDictionary(const char* compressed,
+                                   size_t compressed_length,
+                                   const char* dictionary,
+                                   size_t dictionary_size,
+                                   char* uncompressed);
+
   // This routine uncompresses as much of the "compressed" as possible
   // into sink.  It returns the number of valid bytes added to sink
   // (extra invalid bytes may have been added due to errors; the caller
